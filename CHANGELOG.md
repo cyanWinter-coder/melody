@@ -1,3 +1,13 @@
+## Unreleased (v1.5.0)
+
+* Session-level backpressure and isolation.
+* Per-session bounded send queues that never block broadcasts on a network write.
+* `Config.BufferOverflow` policy: return an overflow result or disconnect the slow session with a recognizable close reason (`CloseSessionQueueFull`).
+* `BroadcastWithResult` / `BroadcastFilterWithResult` / `BroadcastBinaryWithResult` report per-session queue overflows.
+* Safe hub shutdown: stop receiving, drain healthy queues within `Config.ShutdownTimeout`, force-close and mark timed-out queues as discarded (`CloseDrainTimeout`, `ErrMessageDropped`, `*DrainError`).
+* `CloseWithTimeout`, `Session.CloseCode` and `Session.CloseText`.
+* Write pumps and ping tickers are always reclaimed; close channels are never sent on after close.
+
 ## 2025-10-28 (v1.4.0)
 
 * Support per-message write deadlines by @troutowicz (PR-100)

@@ -32,6 +32,19 @@ type handleCloseFunc func(*Session, int, string) error
 type handleSessionFunc func(*Session)
 type filterFunc func(*Session) bool
 
+// BroadcastResult reports the outcome of a result-reporting broadcast.
+// Enqueueing is all-or-nothing per session: sessions whose bounded queue was
+// full are listed in Overflows and never received the message, every other
+// matching session accepted it. Broadcasts never wait for the network writes
+// themselves.
+type BroadcastResult struct {
+	// Overflows lists the sessions that rejected the message because their
+	// send queue was full. When Config.BufferOverflow is
+	// DisconnectSlowSession these sessions have also been scheduled for
+	// disconnect with CloseSessionQueueFull.
+	Overflows []*Session
+}
+
 // Melody implements a websocket manager.
 type Melody struct {
 	Config                   *Config
@@ -56,7 +69,7 @@ func New() *Melody {
 		CheckOrigin:     func(r *http.Request) bool { return true },
 	}
 
-	return &Melody{
+	m := &Melody{
 		Config:                   newConfig(),
 		Upgrader:                 upgrader,
 		messageHandler:           func(*Session, []byte) {},
@@ -68,8 +81,10 @@ func New() *Melody {
 		connectHandler:           func(*Session) {},
 		disconnectHandler:        func(*Session) {},
 		pongHandler:              func(*Session) {},
-		hub:                      newHub(),
 	}
+	m.hub = newHub(m)
+
+	return m
 }
 
 // HandleConnect fires fn when a session connects.
@@ -159,11 +174,17 @@ func (m *Melody) HandleRequestWithKeys(w http.ResponseWriter, r *http.Request, k
 		conn:       conn,
 		output:     make(chan envelope, m.Config.MessageBufferSize),
 		outputDone: make(chan struct{}),
+		pumpDone:   make(chan struct{}),
 		melody:     m,
 		open:       true,
 	}
 
-	m.hub.register(session)
+	if !m.hub.register(session) {
+		// The hub started shutting down between the closed check above and the
+		// upgrade; reject the fresh connection instead of leaking it.
+		session.close()
+		return ErrClosed
+	}
 
 	m.connectHandler(session)
 
@@ -175,7 +196,11 @@ func (m *Melody) HandleRequestWithKeys(w http.ResponseWriter, r *http.Request, k
 		m.hub.unregister(session)
 	}
 
+	// Signal the write pump to stop and wait for it to finish so that a
+	// session teardown never leaves a writer goroutine (or its ping ticker)
+	// behind. close is idempotent with the pump's own deferred teardown.
 	session.close()
+	<-session.pumpDone
 
 	m.disconnectHandler(session)
 
@@ -189,7 +214,7 @@ func (m *Melody) Broadcast(msg []byte) error {
 	}
 
 	message := envelope{t: websocket.TextMessage, msg: msg}
-	m.hub.broadcast(message)
+	m.hub.broadcast(message, false)
 
 	return nil
 }
@@ -201,7 +226,7 @@ func (m *Melody) BroadcastFilter(msg []byte, fn func(*Session) bool) error {
 	}
 
 	message := envelope{t: websocket.TextMessage, msg: msg, filter: fn}
-	m.hub.broadcast(message)
+	m.hub.broadcast(message, false)
 
 	return nil
 }
@@ -230,7 +255,7 @@ func (m *Melody) BroadcastBinary(msg []byte) error {
 	}
 
 	message := envelope{t: websocket.BinaryMessage, msg: msg}
-	m.hub.broadcast(message)
+	m.hub.broadcast(message, false)
 
 	return nil
 }
@@ -242,7 +267,7 @@ func (m *Melody) BroadcastBinaryFilter(msg []byte, fn func(*Session) bool) error
 	}
 
 	message := envelope{t: websocket.BinaryMessage, msg: msg, filter: fn}
-	m.hub.broadcast(message)
+	m.hub.broadcast(message, false)
 
 	return nil
 }
@@ -254,6 +279,40 @@ func (m *Melody) BroadcastBinaryOthers(msg []byte, s *Session) error {
 	})
 }
 
+// BroadcastWithResult broadcasts a text message to all sessions and reports
+// which sessions rejected it because their bounded send queue was full.
+// Delivery to healthy sessions is unaffected by the overflows.
+func (m *Melody) BroadcastWithResult(msg []byte) (BroadcastResult, error) {
+	if m.hub.closed() {
+		return BroadcastResult{}, ErrClosed
+	}
+
+	message := envelope{t: websocket.TextMessage, msg: msg}
+	return BroadcastResult{Overflows: m.hub.broadcast(message, true)}, nil
+}
+
+// BroadcastFilterWithResult broadcasts a text message to the sessions fn
+// returns true for and reports per-session queue overflows.
+func (m *Melody) BroadcastFilterWithResult(msg []byte, fn func(*Session) bool) (BroadcastResult, error) {
+	if m.hub.closed() {
+		return BroadcastResult{}, ErrClosed
+	}
+
+	message := envelope{t: websocket.TextMessage, msg: msg, filter: fn}
+	return BroadcastResult{Overflows: m.hub.broadcast(message, true)}, nil
+}
+
+// BroadcastBinaryWithResult broadcasts a binary message to all sessions and
+// reports per-session queue overflows.
+func (m *Melody) BroadcastBinaryWithResult(msg []byte) (BroadcastResult, error) {
+	if m.hub.closed() {
+		return BroadcastResult{}, ErrClosed
+	}
+
+	message := envelope{t: websocket.BinaryMessage, msg: msg}
+	return BroadcastResult{Overflows: m.hub.broadcast(message, true)}, nil
+}
+
 // Sessions returns all sessions. An error is returned if the melody session is closed.
 func (m *Melody) Sessions() ([]*Session, error) {
 	if m.hub.closed() {
@@ -262,15 +321,18 @@ func (m *Melody) Sessions() ([]*Session, error) {
 	return m.hub.all(), nil
 }
 
-// Close closes the melody instance and all connected sessions.
+// Close closes the melody instance and all connected sessions. It first stops
+// accepting new messages and connections, then waits up to
+// Config.ShutdownTimeout for the healthy session queues to drain. Sessions that
+// cannot drain in time are force-closed with CloseDrainTimeout and their
+// undelivered messages are reported through the error handler and a
+// *DrainError.
 func (m *Melody) Close() error {
 	if m.hub.closed() {
 		return ErrClosed
 	}
 
-	m.hub.exit(envelope{t: websocket.CloseMessage, msg: []byte{}})
-
-	return nil
+	return m.closeWithTimeout(envelope{t: websocket.CloseMessage, msg: []byte{}}, m.Config.ShutdownTimeout)
 }
 
 // CloseWithMsg closes the melody instance with the given close payload and all connected sessions.
@@ -280,8 +342,25 @@ func (m *Melody) CloseWithMsg(msg []byte) error {
 		return ErrClosed
 	}
 
-	m.hub.exit(envelope{t: websocket.CloseMessage, msg: msg})
+	return m.closeWithTimeout(envelope{t: websocket.CloseMessage, msg: msg}, m.Config.ShutdownTimeout)
+}
 
+// CloseWithTimeout works like CloseWithMsg but bounds the drain phase with the
+// given timeout instead of Config.ShutdownTimeout. A timeout of zero only
+// enqueues the graceful close frames; sessions that cannot accept them
+// immediately are force-closed with CloseDrainTimeout.
+func (m *Melody) CloseWithTimeout(msg []byte, timeout time.Duration) error {
+	if m.hub.closed() {
+		return ErrClosed
+	}
+
+	return m.closeWithTimeout(envelope{t: websocket.CloseMessage, msg: msg}, timeout)
+}
+
+func (m *Melody) closeWithTimeout(msg envelope, timeout time.Duration) error {
+	if drainErr := m.hub.exit(msg, timeout); drainErr != nil {
+		return drainErr
+	}
 	return nil
 }
 
@@ -312,7 +391,7 @@ func (m *Melody) BroadcastWithDeadline(msg []byte, deadline time.Duration) error
 		msg:       msg,
 		writeWait: deadline,
 	}
-	m.hub.broadcast(message)
+	m.hub.broadcast(message, false)
 
 	return nil
 }
@@ -330,7 +409,7 @@ func (m *Melody) BroadcastFilterWithDeadline(msg []byte, deadline time.Duration,
 		filter:    fn,
 		writeWait: deadline,
 	}
-	m.hub.broadcast(message)
+	m.hub.broadcast(message, false)
 
 	return nil
 }
@@ -347,7 +426,7 @@ func (m *Melody) BroadcastBinaryWithDeadline(msg []byte, deadline time.Duration)
 		msg:       msg,
 		writeWait: deadline,
 	}
-	m.hub.broadcast(message)
+	m.hub.broadcast(message, false)
 
 	return nil
 }
@@ -365,7 +444,7 @@ func (m *Melody) BroadcastBinaryFilterWithDeadline(msg []byte, deadline time.Dur
 		filter:    fn,
 		writeWait: deadline,
 	}
-	m.hub.broadcast(message)
+	m.hub.broadcast(message, false)
 
 	return nil
 }

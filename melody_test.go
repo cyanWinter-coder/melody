@@ -580,7 +580,7 @@ func TestErrSessionClosed(t *testing.T) {
 	assert.ErrorIs(t, s.WriteBinaryWithDeadline(TestMsg, time.Second), ErrSessionClosed)
 
 	assert.ErrorIs(t, s.writeRaw(envelope{}), ErrWriteClosed)
-	s.writeMessage(envelope{})
+	assert.ErrorIs(t, s.enqueue(envelope{}), ErrSessionClosed)
 }
 
 func TestErrMessageBufferFull(t *testing.T) {
